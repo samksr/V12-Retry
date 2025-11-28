@@ -1,7 +1,6 @@
-// index.js - Improved Twitter Monitoring Bot v12.0
-// 🚀 Enhanced: Retries, Parallel Fetches, Validation, Config, Threads, Security, Health
-// Deploy: Upload to GitHub, connect to Railway. Set env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, USERS_TO_MONITOR (comma-separated)
-// npm install: node-telegram-bot-api axios rss-parser fs path https http express p-retry helmet
+// index.js - Improved Twitter Monitoring Bot v12.1 (Fixed Set Iterable Error)
+// 🚀 Fix: loadJson defaults to [] for cache/state; try-catch on init
+// Deploy: Push to GitHub; Zeabur auto-redeploys. Set env vars as before.
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
@@ -134,7 +133,7 @@ const NITTER_INSTANCES = [
 ];
 
 // ==========================================
-// 4. PERSISTENCE
+// 4. PERSISTENCE (FIXED: Defaults to [] for cache)
 // ==========================================
 const FILES = {
   cache: path.join(__dirname, 'tweet_cache.json'),
@@ -143,14 +142,38 @@ const FILES = {
 };
 
 function loadJson(file, defaultValue = null) {
+  // FIXED: Determine default based on file type
+  let fileDefault = defaultValue;
+  if (!fileDefault) {
+    if (file === FILES.users) fileDefault = [];
+    else if (file === FILES.cache) fileDefault = []; // CRITICAL: Array for Set
+    else if (file === FILES.state) fileDefault = {}; // Object for bootstrap state
+    else fileDefault = [];
+  }
+
   try {
     if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
+      const content = fs.readFileSync(file, 'utf8');
+      const parsed = JSON.parse(content);
+      // Validate: Ensure it's the expected type
+      if (file === FILES.cache && !Array.isArray(parsed)) {
+        console.warn(`⚠️ Invalid cache file (not array), resetting to []`);
+        return fileDefault;
+      }
+      if (file === FILES.users && !Array.isArray(parsed)) {
+        console.warn(`⚠️ Invalid users file (not array), resetting to []`);
+        return fileDefault;
+      }
+      if (file === FILES.state && typeof parsed !== 'object') {
+        console.warn(`⚠️ Invalid state file (not object), resetting to {}`);
+        return fileDefault;
+      }
+      return parsed;
     }
   } catch (e) {
     console.error(`❌ Failed to load ${file}:`, e.message);
   }
-  return defaultValue || (file === FILES.users ? [] : {});
+  return fileDefault;
 }
 
 function saveJson(file, data) {
@@ -161,9 +184,18 @@ function saveJson(file, data) {
   }
 }
 
-const sentTweetIds = new Set(loadJson(FILES.cache));
-const userBootstrapState = loadJson(FILES.state) || {};
-let usersToMonitor = loadJson(FILES.users);
+// FIXED: Safe init with fallback
+let sentTweetIds;
+try {
+  const loadedCache = loadJson(FILES.cache, []);
+  sentTweetIds = new Set(loadedCache);
+} catch (e) {
+  console.error(`❌ Cache init failed, starting empty:`, e.message);
+  sentTweetIds = new Set();
+}
+
+const userBootstrapState = loadJson(FILES.state, {});
+let usersToMonitor = loadJson(FILES.users, []);
 if (usersToMonitor.length === 0) {
   usersToMonitor = (process.env.USERS_TO_MONITOR || '').split(',').map(u => u.trim().replace('@', '')).filter(u => u);
 }
@@ -216,7 +248,7 @@ async function fetchNitter(username) {
         });
         if (feed && feed.items && feed.items.length > 0) {
           const items = feed.items
-            .filter(item => !item.link.includes('/status/') && item.link.includes('status/')) // Basic top-level filter
+            .filter(item => item.link.includes('/status/')) // Basic filter (adjusted for Nitter links)
             .map(t => {
               const match = t.link.match(/\/status\/(\d+)/);
               return {
@@ -334,8 +366,7 @@ async function checkFeeds(manualTrigger = false) {
       return { user, newTweets: userNewCount };
     });
 
-    const results = await Promise.allSettled(fetchPromises);
-    // Log batch results...
+    await Promise.allSettled(fetchPromises); // Fire and forget results for simplicity
   }
 
   // Save if changes
@@ -369,6 +400,8 @@ const MAIN_KEYBOARD = {
 function validateUsername(username) {
   return config.USERNAME_REGEX.test(username);
 }
+
+const userStates = {}; // Per-chat state
 
 bot.on('message', async (msg) => {
   if (!msg.text) return;
@@ -436,11 +469,9 @@ bot.on('message', async (msg) => {
     const statsMsg = `<b>📈 Analytics</b>\n\nUsers: \( {usersToMonitor.length}\nTotal Tracked Tweets: \){sentTweetIds.size}\nActivity Level: \( {activityCounter} (recent checks)\nLast Check: \){lastCheckTimestamp ? new Date(lastCheckTimestamp).toLocaleString() : 'N/A'}`;
     bot.sendMessage(cid, statsMsg, { parse_mode: 'HTML', ...MAIN_KEYBOARD });
   } else if (text === '/start') {
-    bot.sendMessage(cid, `<b>⚡ Twitter Bot v12.0 (ENHANCED)</b>\n\n✅ <b>Engine:</b> Sotwe + 12 Nitter (w/ retries)\n✅ <b>Cache:</b> Smart 30s TTL\n✅ <b>Speed:</b> Parallel checks (~20-60s adaptive)\n\n⚠️ <i>Unofficial tool; complies with fair use. Not affiliated with X/Twitter.</i>`, { parse_mode: 'HTML', ...MAIN_KEYBOARD });
+    bot.sendMessage(cid, `<b>⚡ Twitter Bot v12.1 (FIXED)</b>\n\n✅ <b>Engine:</b> Sotwe + 12 Nitter (w/ retries)\n✅ <b>Cache:</b> Smart 30s TTL\n✅ <b>Speed:</b> Parallel checks (~20-60s adaptive)\n\n⚠️ <i>Unofficial tool; complies with fair use. Not affiliated with X/Twitter.</i>`, { parse_mode: 'HTML', ...MAIN_KEYBOARD });
   }
 });
-
-const userStates = {}; // Per-chat state
 
 bot.on('callback_query', (query) => {
   if (query.data.startsWith('RM_')) {
@@ -466,8 +497,8 @@ app.get('/health', (req, res) => {
   const failureRate = stats.misses > 0 ? (stats.misses / (stats.hits + stats.misses) * 100).toFixed(1) : 0;
   res.json({
     status: 'ok',
-    version: '12.0.0',
-    mode: 'Enhanced Parallel Rotator',
+    version: '12.1.0',
+    mode: 'Enhanced Parallel Rotator (Fixed)',
     users: usersToMonitor.length,
     cache: stats,
     tweetsTracked: sentTweetIds.size,
@@ -484,7 +515,7 @@ app.listen(PORT, '0.0.0.0', () => {
 // ==========================================
 // 9. STARTUP & MAIN LOOP (ADAPTIVE INTERVAL)
 // ==========================================
-console.log('🚀 Booting v12.0 (Enhanced Parallel Rotator)...');
+console.log('🚀 Booting v12.1 (Enhanced Parallel Rotator - Fixed)...');
 console.log(`📊 Monitoring: ${usersToMonitor.join(', ') || 'None'}`);
 
 // Initial check
